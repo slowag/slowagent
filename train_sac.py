@@ -15,13 +15,13 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
 from utils import make_env_continuous
-from nets import SoftQNetwork
+from nets.sac_nets import SoftQNetwork
 import trainers
 from replay_buffer import ReplayMemory
 
 @dataclass
 class Args:
-    exp_name: str = "sac"
+    exp_name: str = ""
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
@@ -31,9 +31,9 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "asynchronous-agent"
+    wandb_project_name: str = "slow-agent"
     """the wandb's project name"""
-    wandb_entity: str = 'asynchronous-agent'
+    wandb_entity: str = None
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
@@ -59,6 +59,8 @@ class Args:
     """the learning rate of the Q network network optimizer"""
     policy_frequency: int = 2
     """the frequency of training policy (delayed)"""
+    update_frequency: int = 4
+    """the frequency of training updates"""
     policy_iteration: int = -1
     """how many times to update the actor per iteration"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
@@ -77,8 +79,6 @@ class Args:
     """number of envs to collect experiance"""
     N_hidden_layers: int = 1
     """number of hidden layers in Agent"""
-    beta: float = 0.
-    """elegibility trace decay"""
     actor_hidden_dim: int = 256
     """number of neurons in hidden layers of the actor"""
     train_only_last_layer: bool = False
@@ -87,10 +87,6 @@ class Args:
     """decreasing learning rate coefficient"""
     trainer: str = 'default'
     """type of the trainer"""
-    add_last_action: bool = False
-    """add last action to the input of the actor"""
-    add_last_reward: bool = False
-    """add last reward to the input of the actor"""
     warm_up_seq: int = 0
     """warm up sequence length for the actor while trainig with delayed action sampling from the buffer"""
     history_states: int = 1
@@ -99,12 +95,10 @@ class Args:
     """number of last actions to include in the observation"""
     target_entropy_scale: float = 1.
     """coefficient for scaling the autotune entropy target"""
-    hidden_skip_ratio: float = 0.25
-    """ratio neurons with skip connections"""
     save_model: bool = True
     """save the actor model"""
     detach_hiddens: bool = False
-    """detach some hidden activations :)"""
+    """detach some hidden activations"""
     normalize_observation: bool = False
     """normalize the observation"""
     eval_model: bool = True
@@ -117,7 +111,20 @@ class Args:
     """max steps for a custom mujoco env"""
     speed_up: int = 1
     """speed up the environment, make the time between observations smaller / speed_up"""
-
+    optimizer: str = 'adam'
+    """optimizer for the actor"""
+    positive_obs: bool = False
+    """make the observation positive"""
+    wd: float = 0.
+    """weight decay"""
+    n_buckets: int = 0
+    """number of buckets to use to bucketize the observation"""
+    bucket_step: float = 1
+    """step between buckets"""
+    log_interval: int = 1000
+    """log interval"""
+    episodic_return_threshold: int = 1000
+    """episodic return threshold"""
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
@@ -133,7 +140,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     args.policy_iteration = args.policy_frequency if args.policy_iteration < 1 else args.policy_iteration
     print('args', args)
 
-    group_name = f"{args.agent}_fs{args.frame_skip}_N{args.N_hidden_layers+2}"
+    group_name = f"{args.agent}_fs{args.frame_skip}_N{args.N_hidden_layers+2}_ha{args.num_last_actions}_hs{args.history_states}"
     if args.exp_name != "":
         group_name = f"{group_name}_{args.exp_name}"
     run_name = f"{group_name}_s{args.seed}_{int(time.time())}"
@@ -154,7 +161,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             name=run_name,
             monitor_gym=True,
             save_code=True,
-            tags=["v3"]
+            tags=["iclr"]
         )
     writer = SummaryWriter(args.out_dir)
     writer.add_text(
@@ -175,30 +182,18 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     # env setup
     envs = gym.vector.SyncVectorEnv([make_env_continuous(args.env_id, args.seed, 0, args.capture_video, run_name, args) for i in range(args.num_envs)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+    obs_dim = np.array(envs.single_observation_space.shape).prod()
+    args.initial_obs_size = int((obs_dim - args.num_last_actions * np.array(envs.single_action_space.shape).prod()) / args.history_states)
+    print('initial_obs_size', args.initial_obs_size)
 
     max_action = float(envs.single_action_space.high[0])
-    # default agent
-    if args.agent == "default":
-        print('default sac agent')
-        from nets import Actor
+
+    try:
+        import nets
+        Actor = getattr(nets.sac_nets, args.agent)
         actor = Actor(envs, args).to(device)
-    # delayed action agents
-    elif args.agent == "slow":
-        from nets import ActorSlow
-        actor = ActorSlow(envs, args).to(device)
-    elif args.agent == "slowskip":
-        from nets import ActorSlowSkip
-        actor = ActorSlowSkip(envs, args).to(device)
-    elif args.agent == "slowresskip":
-        from nets import ActorSlowResSkip
-        actor = ActorSlowResSkip(envs, args).to(device)
-    else:
-        try:
-            import nets
-            Actor = getattr(nets, args.agent)
-            actor = Actor(envs, args).to(device)
-        except AttributeError:
-            raise ValueError(f"unknown agent type {args.agent}")
+    except AttributeError:
+        raise ValueError(f"unknown agent type {args.agent}")
     print('actor', actor)
 
     qf1 = SoftQNetwork(envs).to(device)
@@ -207,9 +202,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     qf2_target = SoftQNetwork(envs).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
+    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr, weight_decay=args.wd)
     print('actor.parameters().shape', [p.shape for p in actor.parameters()])
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    if args.optimizer == 'sgd':
+        actor_optimizer = optim.SGD(list(actor.parameters()), lr=args.policy_lr)
+    else:
+        actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     # Automatic entropy tuning
     if args.autotune:
@@ -228,6 +226,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     os.environ['MUJOCO_GL'] = "egl"
 
     if args.trainer == 'default':
+        from trainers.trainers_sac import train
         rb = ReplayBuffer(
             args.buffer_size,
             envs.single_observation_space,
@@ -237,19 +236,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             handle_timeout_termination=False,
         )
         print('default sac training')
-        trainers.train(args, envs, actor, qf1, qf2, qf1_target, qf2_target,
+        train(args, envs, actor, qf1, qf2, qf1_target, qf2_target,
                       q_optimizer, actor_optimizer, a_optimizer, rb, writer, device, alpha, log_alpha, target_entropy)
-    elif args.trainer == 'delayed_action':
-        rb = None
-        args.learning_starts = 0
-        print('starting delayed action training loop, this is online algorithm')
-        qf1_copy = SoftQNetwork(envs).to(device) # we will need a copy of the qf1 and qf2 networks to compute delayed update online
-        qf2_copy = SoftQNetwork(envs).to(device)
-        trainers.train_delayed_action(args, envs, actor, qf1, qf2, qf1_target, qf2_target,
-                                      q_optimizer, actor_optimizer, a_optimizer,
-                                      rb, writer, device, alpha, log_alpha, target_entropy,
-                                      qf1_copy=qf1_copy, qf2_copy=qf2_copy)
-    elif args.trainer == 'delayed_action_buffer_hiddens':
+
+    elif args.trainer == 'delayed_buffer_hiddens':
+        from trainers.trainers_sac import train_delayed_buffer_hiddens
         rb = ReplayMemory(
             args.buffer_size,
             np.array(envs.single_observation_space.shape).prod(),
@@ -258,10 +249,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             device=device,
         )
         print('starting delayed SAC buffer training loop')
-        trainers.train_delayed_action_buffer_hiddens(args, envs, actor, qf1, qf2, qf1_target, qf2_target,
+        train_delayed_buffer_hiddens(args, envs, actor, qf1, qf2, qf1_target, qf2_target,
                                                      q_optimizer, actor_optimizer, a_optimizer,
                                                      rb, writer, device, alpha, log_alpha, target_entropy)
-    elif args.trainer == 'delayed_behaviour_cloning':
+
+    elif args.trainer == 'delayed_buffer_efficient':
+        from trainers.trainers_sac import train_delayed_efficient
         rb = ReplayMemory(
             args.buffer_size,
             np.array(envs.single_observation_space.shape).prod(),
@@ -269,27 +262,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             envs.single_observation_space.dtype,
             device=device,
         )
-        from nets import Actor
+        print('starting delayed SAC buffer training loop')
+        train_delayed_efficient(args, envs, actor, qf1, qf2, qf1_target, qf2_target,
+                                         q_optimizer, actor_optimizer, a_optimizer,
+                                         rb, writer, device, alpha, log_alpha, target_entropy)
 
-        args_target = copy.deepcopy(args)
-        # setting default hyperparameters for the target actor
-        args_target.N_hidden_layers = 1
-        args_target.actor_hidden_dim = 256
-        args_target.num_last_actions = 0
-        args_target.history_states = 1
-        actor_target = Actor(envs, args_target).to(device)
-        model_map = {'Hopper-v4': 'your_model_path',
-                     'HalfCheetah-v4': 'your_model_path',
-                     'Walker2d-v4': 'your_model_path',
-                     'Ant-v4': 'your_model_path'}
-        print('loading target actor weights')
-        actor_target.load_state_dict(torch.load(model_map[args.env_id]))
-        actor_target.eval()
-        print('testing target actor model')
-        from utils import evaluate_sac
-        episodic_returns = evaluate_sac(actor_target, args, args.device, eval_episodes=1)
-        print('actor_target mean', np.mean(episodic_returns), 'std', np.std(episodic_returns))
-        print('starting behaviour cloning training loop')
-        trainers.train_delayed_behaviour_cloning(args, envs, actor_target, actor, actor_optimizer, rb, writer, device)
     else:
         assert 0, 'Unknown trainer'
